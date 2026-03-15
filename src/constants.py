@@ -1,0 +1,2 @@
+LLM_MODEL = "gpt-4o-mini"
+GOOGLE_FIELD_MASK = "routes.duration,routes.distanceMeters,routes.legs.duration,routes.legs.localizedValues,routes.legs.staticDuration,routes.legs.distanceMeters,routes.optimizedIntermediateWaypointIndex"

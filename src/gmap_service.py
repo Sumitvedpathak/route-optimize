@@ -9,7 +9,7 @@ from src.constants import GOOGLE_FIELD_MASK
 from src.schema import RouteLeg, RouteRequest, RouteResponse
 load_dotenv()
 
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+GOOGLE_MAPS_API_KEY = (os.getenv("GOOGLE_MAPS_API_KEY") or "").strip()
 GOOGLE_MAPS_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 
 

@@ -4,6 +4,7 @@ import re
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from fastapi import HTTPException
 from dotenv import load_dotenv
 from src.constants import GOOGLE_FIELD_MASK
 from src.schema import RouteLeg, RouteRequest, RouteResponse
@@ -11,11 +12,12 @@ load_dotenv()
 
 GOOGLE_MAPS_API_KEY = (os.getenv("GOOGLE_MAPS_API_KEY") or "").strip()
 GOOGLE_MAPS_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+EST = timezone(timedelta(hours=-5))
 
 
 def _parse_base_departure_time(departure_time: str | None) -> datetime:
     if not departure_time or departure_time.strip().lower() == "now":
-        return datetime.now().astimezone()
+        return datetime.now(EST)
 
     normalized = departure_time.strip()
     if normalized.endswith("Z"):
@@ -24,10 +26,11 @@ def _parse_base_departure_time(departure_time: str | None) -> datetime:
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
-        return datetime.now().astimezone()
+        return datetime.now(EST)
 
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        # Treat naive incoming datetimes as EST per API contract.
+        return parsed.replace(tzinfo=EST)
 
     return parsed
 
@@ -59,6 +62,25 @@ def _to_utc_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _to_est_offset(dt: datetime) -> str:
+    return dt.astimezone(EST).isoformat(timespec="seconds")
+
+
+def _normalize_departure_for_google(dt: datetime, explicit_departure: bool) -> datetime:
+    now_utc = datetime.now(timezone.utc)
+    if dt.astimezone(timezone.utc) > now_utc:
+        return dt
+
+    if explicit_departure:
+        # Keep the user's local EST clock time (e.g. 10:00) and roll forward by day.
+        adjusted = dt
+        while adjusted.astimezone(timezone.utc) <= now_utc:
+            adjusted += timedelta(days=1)
+        return adjusted
+
+    return (now_utc + timedelta(minutes=2)).astimezone(EST)
+
+
 def _format_distance_km(distance_meters: Any) -> str:
     try:
         meters = float(distance_meters)
@@ -88,8 +110,15 @@ def _format_duration_text(raw_duration: Any) -> str:
     return f"{hours}hr {minutes}min"
 
 def get_optimized_route(route_request: RouteRequest) -> RouteResponse:
-    base_departure_time = _parse_base_departure_time(route_request.departure_time)
-
+    requested_departure_time = _parse_base_departure_time(route_request.departure_time)
+    has_explicit_departure = bool(
+        route_request.departure_time and route_request.departure_time.strip().lower() != "now"
+    )
+    google_departure_time = _normalize_departure_for_google(
+        requested_departure_time,
+        has_explicit_departure
+    )
+    base_departure_time = requested_departure_time if has_explicit_departure else google_departure_time
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
@@ -99,7 +128,7 @@ def get_optimized_route(route_request: RouteRequest) -> RouteResponse:
         "origin": {"address": route_request.source},
         "destination": {"address": route_request.destination},
         "intermediates": [{"address": waypoint} for waypoint in route_request.waypoints],
-        "departureTime": _to_utc_z(base_departure_time),
+        "departureTime": _to_utc_z(google_departure_time),
         "travelMode": "DRIVE",
         "routingPreference": "TRAFFIC_AWARE",
         "optimizeWaypointOrder": True,
@@ -116,7 +145,13 @@ def get_optimized_route(route_request: RouteRequest) -> RouteResponse:
 
     # print("payload: ", payload)
     response = requests.post(GOOGLE_MAPS_URL, headers=headers, json=payload).json()
+    if response.get("error"):
+        raise HTTPException(status_code=400, detail=response["error"].get("message", "Google Maps API error"))
+
     routes = response.get("routes", [])
+    if not routes:
+        raise HTTPException(status_code=404, detail="No route found for the provided addresses.")
+
     optimized_indices: list[int] = []
     if routes:
         optimized_indices = routes[0].get("optimizedIntermediateWaypointIndex", [])
@@ -158,8 +193,8 @@ def get_optimized_route(route_request: RouteRequest) -> RouteResponse:
                 to_address=optimized_address_list[index + 1],
                 duration=duration_text,
                 distance=distance_text or "",
-                departure_time=_to_utc_z(current_departure_time),
-                arrival_time=_to_utc_z(current_arrival_time),
+                departure_time=_to_est_offset(current_departure_time),
+                arrival_time=_to_est_offset(current_arrival_time),
             ).model_dump(exclude_none=True)
         )
         current_departure_time = current_arrival_time
